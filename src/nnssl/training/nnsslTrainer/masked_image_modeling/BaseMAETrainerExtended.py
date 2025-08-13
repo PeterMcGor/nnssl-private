@@ -88,17 +88,23 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         print("Registering hook for bottleneck features...")
         print(self.network)
         self._register_bottleneck_hook()
+        self.update_optimizer_params()  # To use the loss
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.SGD(
-            self.network.parameters(),
-            self.initial_lr,
-            weight_decay=self.weight_decay,
-            momentum=self.momentum,
-            nesterov=self.nesterov,
-        )
-        lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
-        return optimizer, lr_scheduler
+    def update_optimizer_params(self):
+        # Collect trainable loss params not already in optimizer
+        self.loss.to(self.device)
+        loss_params = [p for p in self.loss.parameters() if p.requires_grad]
+        if not loss_params:
+            return
+
+        existing = {id(p) for g in self.optimizer.param_groups for p in g["params"]}
+        new_params = [p for p in loss_params if id(p) not in existing]
+        if new_params:
+            self.optimizer.add_param_group({"params": new_params})
+            self.print_to_log_file(f"Added {len(new_params)} loss parameters to optimizer.")
+
+        # Recreate scheduler so it knows about all param groups
+        self.lr_scheduler = PolyLRScheduler(self.optimizer, self.initial_lr, self.num_epochs)     
     
     def build_loss(self):
         """
@@ -128,6 +134,7 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         masked_data = data * mask
 
         self.optimizer.zero_grad(set_to_none=True)
+        print(self.optimizer)
         # Autocast is a little bitch.
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
