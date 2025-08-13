@@ -14,7 +14,7 @@ from nnssl.ssl_data.configure_basic_dummyDA import configure_rotation_dummyDA_mi
 
 from nnssl.training.loss.mse_loss import MAEMSELoss, LossMaskMSELoss
 from nnssl.training.loss.latent_loss import BottleNeckContrastiveLoss
-from nnssl.training.nnsslTrainer.masked_image_modeling import BaseMAETrainer
+from nnssl.training.nnsslTrainer.masked_image_modeling.BaseMAETrainer import BaseMAETrainer
 from torch import nn
 from batchgenerators.transforms.spatial_transforms import SpatialTransform, MirrorTransform
 from batchgenerators.transforms.abstract_transforms import AbstractTransform, Compose
@@ -27,12 +27,30 @@ from batchgenerators.utilities.file_and_folder_operations import join
 import SimpleITK as sitk
 from batchgenerators.utilities.file_and_folder_operations import save_json
 
+from nnssl.experiment_planning.experiment_planners.plan import ConfigurationPlan, Plan
 from nnssl.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 import numpy as np
 
 
 class BaseMAETrainerExtended(BaseMAETrainer):
+    def __init__(
+        self,
+        plan: Plan,
+        configuration_name: str,
+        fold: int,
+        pretrain_json: dict,
+        device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__(plan, configuration_name, fold, pretrain_json, device)
+        self.config_plan.patch_size = (160, 160, 160)
+        self.mask_percentage: float = 0.75
 
+        self.im_output_folder = os.path.join(self.output_folder, "img_log")
+        os.makedirs(self.im_output_folder, exist_ok=True)
+        self.save_imgs_every_n_epochs = 200
+        self._feat_handle = None
+        self._bottleneck_features = []
+        
     def _get_net(self):
         return self.network.module if isinstance(self.network, DDP) else self.network
 
@@ -69,6 +87,15 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         print("Registering hook for bottleneck features...")
         self._register_bottleneck_hook()
 
+    def build_loss(self):
+        """
+        This is where you build your loss function. You can use anything from torch.nn here.
+        In general the MAE losses are only applied on regions where the mask is 0.
+
+        :return:
+        """
+        return BottleNeckContrastiveLoss()
+    
     def train_step(self, batch: dict) -> dict:
         data = batch["data"]
         data = data.to(self.device, non_blocking=True)
