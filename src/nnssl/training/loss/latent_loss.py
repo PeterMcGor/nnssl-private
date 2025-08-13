@@ -8,6 +8,7 @@ class BottleNeckContrastiveLoss(nn.Module):
         super().__init__()
         self.feat_weight = feat_weight
 
-    def forward(self, batch, output, mask, latent):
+    def forward(self, batch, output, mask, latent):        
+        print(len(latent))
         print(latent[0].shape)
         return 0

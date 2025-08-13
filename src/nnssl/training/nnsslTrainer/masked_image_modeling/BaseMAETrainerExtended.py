@@ -15,6 +15,7 @@ from nnssl.ssl_data.configure_basic_dummyDA import configure_rotation_dummyDA_mi
 from nnssl.training.loss.mse_loss import MAEMSELoss, LossMaskMSELoss
 from nnssl.training.loss.latent_loss import BottleNeckContrastiveLoss
 from nnssl.training.nnsslTrainer.masked_image_modeling.BaseMAETrainer import BaseMAETrainer
+from nnssl.training.lr_scheduler.polylr import PolyLRScheduler
 from torch import nn
 from batchgenerators.transforms.spatial_transforms import SpatialTransform, MirrorTransform
 from batchgenerators.transforms.abstract_transforms import AbstractTransform, Compose
@@ -85,8 +86,20 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         super(BaseMAETrainerExtended, self).initialize()
         
         print("Registering hook for bottleneck features...")
+        print(self.network)
         self._register_bottleneck_hook()
 
+    def configure_optimizers(self):
+        optimizer = torch.optim.SGD(
+            self.network.parameters(),
+            self.initial_lr,
+            weight_decay=self.weight_decay,
+            momentum=self.momentum,
+            nesterov=self.nesterov,
+        )
+        lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
+        return optimizer, lr_scheduler
+    
     def build_loss(self):
         """
         This is where you build your loss function. You can use anything from torch.nn here.
