@@ -1,0 +1,158 @@
+import os
+from typing import List, Tuple, Union
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from deprecated import deprecated
+from typing_extensions import override
+from dataclasses import asdict
+
+
+import torch
+from nnssl.architectures.get_network_by_name import get_network_by_name
+from nnssl.architectures.get_network_from_plan import get_network_from_plans
+from nnssl.ssl_data.configure_basic_dummyDA import configure_rotation_dummyDA_mirroring_and_inital_patch_size
+
+from nnssl.training.loss.mse_loss import MAEMSELoss, LossMaskMSELoss
+from nnssl.training.nnsslTrainer.masked_image_modeling import BaseMAETrainer
+from torch import nn
+from batchgenerators.transforms.spatial_transforms import SpatialTransform, MirrorTransform
+from batchgenerators.transforms.abstract_transforms import AbstractTransform, Compose
+from batchgenerators.transforms.utility_transforms import NumpyToTensor
+from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
+from torch import autocast
+from nnssl.utilities.helpers import dummy_context
+from torch.nn.parallel import DistributedDataParallel as DDP
+from batchgenerators.utilities.file_and_folder_operations import join
+import SimpleITK as sitk
+from batchgenerators.utilities.file_and_folder_operations import save_json
+
+from nnssl.utilities.default_n_proc_DA import get_allowed_n_proc_DA
+import numpy as np
+
+
+class BottleNeckContrastiveLoss(nn.Module):
+    def __init__(self, feat_weight: float = 0.1):
+        super().__init__()
+        self.feat_weight = feat_weight
+
+    def forward(self, batch, output, mask, latent):
+        print(latent[0].shape)
+        return 0
+
+
+class BaseMAETrainerExtended(BaseMAETrainer):
+
+    def _get_net(self):
+        return self.network.module if isinstance(self.network, DDP) else self.network
+
+    def _resolve_last_encoder_block(self):
+        net = self._get_net()
+        # Prefer an explicit path if your arch has it:
+        if hasattr(net, "encoder") and hasattr(net.encoder, "stages"):
+            return net.encoder.stages[-1]
+        if hasattr(net, "encoder"):
+            # Fallback: last child of decoder
+            children = list(net.encoder.children())
+            if len(children) > 0:
+                return children[-1]
+        print(net.encoder)
+        raise AttributeError("Could not resolve last decoder block for hook registration.")
+
+    def _register_bottleneck_hook(self):
+        if self._feat_handle is not None:
+            self._feat_handle.remove()
+            self._feat_handle = None
+        
+        def hook(module, input, output):
+            self._bottleneck_features.append(output)
+
+        block = self._resolve_last_encoder_block()            
+        self._feat_handle = block.register_forward_hook(hook)        
+
+    def get_bottleneck_features(self):
+        return self.bottleneck_features
+    
+    def initialize(self):
+        super(BaseMAETrainerExtended, self).initialize()
+        
+        print("Registering hook for bottleneck features...")
+        self._register_bottleneck_hook()
+
+    def train_step(self, batch: dict) -> dict:
+        data = batch["data"]
+        data = data.to(self.device, non_blocking=True)
+
+        # We use the self.batch_size as it is not identical with the plan batch_size in ddp cases.
+        mask = self.mask_creation(self.batch_size, self.config_plan.patch_size, self.mask_percentage).to(
+            self.device, non_blocking=True
+        )
+        # Make the mask the same size as the data
+        rep_D, rep_H, rep_W = (
+            data.shape[2] // mask.shape[2],
+            data.shape[3] // mask.shape[3],
+            data.shape[4] // mask.shape[4],
+        )
+        mask = mask.repeat_interleave(rep_D, dim=2).repeat_interleave(rep_H, dim=3).repeat_interleave(rep_W, dim=4)
+
+        masked_data = data * mask
+
+        self.optimizer.zero_grad(set_to_none=True)
+        # Autocast is a little bitch.
+        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
+        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+        # So autocast will only be active if we have a cuda device.
+        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
+            output = self.network(masked_data)
+            # del data
+            latent = self._bottleneck_features
+            l = self.loss(batch, output, mask, latent)
+            # l = self.loss(output, data, mask)
+
+        if self.grad_scaler is not None:
+            self.grad_scaler.scale(l).backward()
+            self.grad_scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
+        
+        # Important: drop reference so graph can be freed
+        self._bottleneck_features = []
+
+        return {"loss": l.detach().cpu().numpy()}
+
+    def validation_step(self, batch: dict) -> dict:
+        data = batch["data"]
+        data = data.to(self.device, non_blocking=True)
+
+        mask = self.mask_creation(self.batch_size, self.config_plan.patch_size, self.mask_percentage).to(
+            self.device, non_blocking=True
+        )
+        # Make the mask the same size as the data
+        rep_D, rep_H, rep_W = (
+            data.shape[2] // mask.shape[2],
+            data.shape[3] // mask.shape[3],
+            data.shape[4] // mask.shape[4],
+        )
+        mask = mask.repeat_interleave(rep_D, dim=2).repeat_interleave(rep_H, dim=3).repeat_interleave(rep_W, dim=4)
+
+        masked_data = data * mask
+
+        # Autocast is a little bitch.
+        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
+        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+        # So autocast will only be active if we have a cuda device.
+        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
+            output = self.network(masked_data)
+
+            latent = self._bottleneck_features
+            l = self.loss(batch, output, mask, latent)
+            # l = self.loss(output, data, mask)
+
+        # Important: drop reference so graph can be freed
+        self._bottleneck_features = []
+
+        return {"loss": l.detach().cpu().numpy()}
