@@ -13,6 +13,7 @@ from nnssl.architectures.get_network_from_plan import get_network_from_plans
 from nnssl.ssl_data.configure_basic_dummyDA import configure_rotation_dummyDA_mirroring_and_inital_patch_size
 
 from nnssl.training.loss.mse_loss import MAEMSELoss, LossMaskMSELoss
+from nnssl.training.loss.latent_loss import BottleNeckContrastiveLoss
 from nnssl.training.nnsslTrainer.masked_image_modeling import BaseMAETrainer
 from torch import nn
 from batchgenerators.transforms.spatial_transforms import SpatialTransform, MirrorTransform
@@ -28,16 +29,6 @@ from batchgenerators.utilities.file_and_folder_operations import save_json
 
 from nnssl.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 import numpy as np
-
-
-class BottleNeckContrastiveLoss(nn.Module):
-    def __init__(self, feat_weight: float = 0.1):
-        super().__init__()
-        self.feat_weight = feat_weight
-
-    def forward(self, batch, output, mask, latent):
-        print(latent[0].shape)
-        return 0
 
 
 class BaseMAETrainerExtended(BaseMAETrainer):
