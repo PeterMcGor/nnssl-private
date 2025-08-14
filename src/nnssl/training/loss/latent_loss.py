@@ -10,6 +10,6 @@ class BottleNeckContrastiveLoss(nn.Module):
         self.proj_latent = nn.Linear(in_dim, out_dim, bias=False)
     
     def forward(self, batch, output, mask, latent):        
-        print(len(latent))
-        print(latent[0].shape)
-        return 0
+        #print(len(latent)) # why is this a list??
+        #print(latent[0].shape)
+        return torch.mean(latent[0]) + torch.mean(output**2) 
