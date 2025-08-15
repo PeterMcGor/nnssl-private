@@ -40,9 +40,7 @@ class SubjectImageSimilarityLoss(nn.Module):
         # Option 1: Just L2 normalization
         return F.normalize(subject_features, dim=1, eps=1e-8)
         
-        # Option 2: Standardization (if you prefer)
-        # return (subject_features - subject_features.mean(dim=0)) / (subject_features.std(dim=0) + 1e-8)
-        
+       
     def extract_subject_data(self, batch, device='cuda'):
         """Extract subject features and IDs from batch dictionary."""
 
@@ -92,16 +90,16 @@ class SubjectImageSimilarityLoss(nn.Module):
         
         # Compute standard deviation across batch for each dimension, then average
         image_std = torch.std(image_emb, dim=0, unbiased=False).mean()
-        subject_std = torch.std(subject_emb, dim=0, unbiased=False).mean()
+        #subject_std = torch.std(subject_emb, dim=0, unbiased=False).mean()
         
         # Encourage std to be at least 0.1 (adjustable target)
         target_std = 0.1
         
         # Only penalize when std is below target (using ReLU)
-        image_penalty = torch.relu(target_std - image_std)
-        subject_penalty = torch.relu(target_std - subject_std)
+        image_penalty = torch.clamp(target_std - image_std, min=0, max=100)
+        #subject_penalty = torch.relu(target_std - subject_std)
         
-        return image_penalty + subject_penalty
+        return image_penalty #+ subject_penalty
     
     def compute_covariance_regularization(self, image_emb, subject_emb):
         """
@@ -169,7 +167,7 @@ class SubjectImageSimilarityLoss(nn.Module):
         total_loss = (self.similarity_weight * similarity_loss +
                      self.variance_weight * variance_loss)
         #print(f"Similarity Loss: {similarity_loss.item()}, Variance Loss: {variance_loss.item()}")
-        stats = self.compute_embedding_stats(image_projected, subject_normalized)
+        #stats = self.compute_embedding_stats(image_projected, subject_normalized)
         #print(f"Embedding Stats: {stats}")
         
         return total_loss

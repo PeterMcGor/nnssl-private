@@ -89,6 +89,8 @@ class nnSSLDatasetBlosc2ExtendInfo(nnSSLDatasetBlosc2):
         session_key, modality_key, volumes_dict = nnSSLDatasetBlosc2ExtendInfo.find_preferred_modality(img)
         if volumes_dict is None:
             raise RuntimeError(f"Skipping case {image_identifier} - No preferred modality found in volumes.")
+        if float(volumes_dict['total intracranial']) < 1000:
+            raise RuntimeError(f"Skipping case {image_identifier} - Total intracranial volume is too small: {volumes_dict['total intracranial']}.")
         data, anon, anat, properties = nnSSLDatasetBlosc2.load_case(dataset_dir, image_dataset, image_identifier)
         return data, anon, anat, {**properties, **{"extra_info": img.to_dict(), 'subject_features':volumes_dict, 'subject_ids':img.image_path}}
 
