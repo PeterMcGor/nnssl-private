@@ -57,10 +57,16 @@ class SubjectImageSimilarityLoss(nn.Module):
 
         subject_features = torch.tensor(subject_features, dtype=torch.float32)
         subject_features = subject_features.to(device)
+        # CRITICAL FIX: Row-wise normalization (per case, independent of batch)
+        row_means = subject_features.mean(dim=1, keepdim=True)
+        row_stds = subject_features.std(dim=1, keepdim=True, unbiased=False)
         
-        # CRITICAL FIX: Normalize the huge values (1.6M, 200K, etc.) 
-        # Your subject features are causing numerical overflow -> NaN
-        #subject_features = (subject_features - subject_features.mean(dim=0, keepdim=True)) / (subject_features.std(dim=0, keepdim=True) + 1e-8)
+        # Avoid division by zero: if std is too small, don't normalize that row
+        safe_std = torch.where(row_stds < 1e-6, torch.ones_like(row_stds), row_stds)
+        subject_features = (subject_features - row_means) / safe_std
+        
+        # Clip extreme values after normalization
+        subject_features = torch.clamp(subject_features, min=-10.0, max=10.0)
             
         return subject_features, subject_ids
     
@@ -69,9 +75,20 @@ class SubjectImageSimilarityLoss(nn.Module):
         Compute direct cosine similarity between corresponding pairs.
         High similarity = low loss.
         """
+        # Add safety checks before normalization
+        if torch.isnan(image_emb).any() or torch.isnan(subject_emb).any():
+            print("WARNING: NaN in embeddings before similarity")
+            return torch.tensor(0.0, device=image_emb.device), torch.zeros(image_emb.shape[0], device=image_emb.device)
+        
+        # Row-wise L2 normalization with safety for zero vectors
+        def safe_normalize(x):
+            norms = torch.norm(x, dim=1, keepdim=True)
+            safe_norms = torch.where(norms < 1e-8, torch.ones_like(norms), norms)
+            return x / safe_norms
+        
         # Normalize embeddings (essential for avoiding trivial solutions)
-        image_emb = F.normalize(image_emb, dim=1, eps=1e-8)
-        subject_emb = F.normalize(subject_emb, dim=1, eps=1e-8)
+        image_emb = safe_normalize(image_emb)#F.normalize(image_emb, dim=1, eps=1e-8)
+        subject_emb = safe_normalize(subject_emb)#F.normalize(subject_emb, dim=1, eps=1e-8)
         
         # Compute cosine similarity for each pair
         cosine_similarities = F.cosine_similarity(image_emb, subject_emb, dim=1)
@@ -147,6 +164,24 @@ class SubjectImageSimilarityLoss(nn.Module):
     
     def forward(self, batch, output, mask, latent):
         subject_features, _ = self.extract_subject_data(batch, output.device)
+
+
+        # Add safety checks for each row
+        if torch.isnan(subject_features).any():
+            print("WARNING: NaN detected in subject_features")
+            subject_features = torch.nan_to_num(subject_features, nan=0.0)
+        
+        # Check for rows with extreme values and handle them individually
+        row_maxes = subject_features.abs().max(dim=1, keepdim=True)[0]
+        extreme_rows = row_maxes > 1e6
+        if extreme_rows.any():
+            print(f"WARNING: {extreme_rows.sum()} rows with extreme values")
+            # Clip extreme rows individually
+            subject_features = torch.where(
+                extreme_rows.expand_as(subject_features),
+                torch.clamp(subject_features, min=-1e6, max=1e6),
+                subject_features
+            )
         
         latent = latent[0]
         batch_size = latent.shape[0]
@@ -154,6 +189,12 @@ class SubjectImageSimilarityLoss(nn.Module):
         # Project images to subject space
         bottleneck_flat = latent.view(batch_size, -1)
         image_projected = self.image_to_subject_projector(bottleneck_flat)
+
+
+        # Check for NaN after projection
+        if torch.isnan(image_projected).any():
+            print("WARNING: NaN detected in image_projected")
+            return torch.tensor(0.0, device=output.device, requires_grad=True)
         
         # Subjects: just normalize (preserve original meaning!)
         subject_normalized = self.normalize_subjects(subject_features)
@@ -162,10 +203,9 @@ class SubjectImageSimilarityLoss(nn.Module):
         similarity_loss, cosine_sims = self.compute_similarity_loss(image_projected, subject_normalized)
         
         # Only regularize the learnable part (image projections)
-        variance_loss = self.compute_variance_regularization(image_projected, image_projected)
+        #variance_loss = self.compute_variance_regularization(image_projected, image_projected)
         
-        total_loss = (self.similarity_weight * similarity_loss +
-                     self.variance_weight * variance_loss)
+        total_loss = self.similarity_weight * similarity_loss #+ self.variance_weight * variance_loss)
         #print(f"Similarity Loss: {similarity_loss.item()}, Variance Loss: {variance_loss.item()}")
         #stats = self.compute_embedding_stats(image_projected, subject_normalized)
         #print(f"Embedding Stats: {stats}")
