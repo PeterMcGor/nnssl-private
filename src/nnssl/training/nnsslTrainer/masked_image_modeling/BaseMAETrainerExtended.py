@@ -9,6 +9,8 @@ from dataclasses import asdict
 import numpy as np
 from loguru import logger
 import torch
+from torch import distributed as dist
+from nnssl.utilities.collate_outputs import collate_outputs
 from nnssl.architectures.get_network_by_name import get_network_by_name
 from nnssl.architectures.get_network_from_plan import get_network_from_plans
 from nnssl.ssl_data.configure_basic_dummyDA import configure_rotation_dummyDA_mirroring_and_inital_patch_size
@@ -274,10 +276,12 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         self.save_imgs_every_n_epochs = 200
         self._feat_handle = None
         self._bottleneck_features = []
-        self.total_batch_size = 12
-        self.num_iterations_per_epoch = 10
-        self.num_val_iterations_per_epoch = 5
-        self.num_epochs = 2
+        self.total_batch_size = 10
+        #self.num_iterations_per_epoch = 10
+        #self.num_val_iterations_per_epoch = 5
+        #self.num_epochs = 2
+        self.prev_loss = None
+        self.prev_val_loss = None
         
     def _get_net(self):
         return self.network.module if isinstance(self.network, DDP) else self.network
@@ -442,6 +446,32 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         self._bottleneck_features = []
 
         return {"loss": l.detach().cpu().numpy()}
+    
+    def on_train_epoch_end(self, train_outputs: List[dict]):
+        self.interrupt_at_nans(train_outputs)
+        outputs = collate_outputs(train_outputs)
+        
+        if self.is_ddp:
+            losses_tr = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(losses_tr, outputs["loss"])
+            loss_here = np.nanmean(np.vstack(losses_tr))  # Changed to nanmean
+        else:
+            loss_here = np.nanmean(outputs["loss"])  # Changed to nanmean
+        
+        self.logger.log("train_losses", loss_here, self.current_epoch)
+
+    def on_validation_epoch_end(self, val_outputs: List[dict]):
+        outputs_collated = collate_outputs(val_outputs)
+        
+        if self.is_ddp:
+            world_size = dist.get_world_size()
+            losses_val = [None for _ in range(world_size)]
+            dist.all_gather_object(losses_val, outputs_collated["loss"])
+            loss_here = np.nanmean(np.vstack(losses_val))  # Changed to nanmean
+        else:
+            loss_here = np.nanmean(outputs_collated["loss"])  # Changed to nanmean
+        
+        self.logger.log("val_losses", loss_here, self.current_epoch)
 
 
 class BaseMAETrainerExtendedSingleSubject(BaseMAETrainerExtended):
