@@ -14,7 +14,7 @@ from nnssl.architectures.get_network_from_plan import get_network_from_plans
 from nnssl.ssl_data.configure_basic_dummyDA import configure_rotation_dummyDA_mirroring_and_inital_patch_size
 
 from nnssl.training.loss.mse_loss import MAEMSELoss, LossMaskMSELoss
-from nnssl.training.loss.latent_loss import BottleNeckContrastiveLoss
+from nnssl.training.loss.latent_loss import BottleNeckContrastiveLoss, ReconstructionAndSimilarityLoss, SubjectImageSimilarityLoss
 from nnssl.training.nnsslTrainer.masked_image_modeling.BaseMAETrainer import BaseMAETrainer
 from nnssl.training.lr_scheduler.polylr import PolyLRScheduler
 
@@ -37,11 +37,58 @@ class nnSSLDatasetBlosc2ExtendInfo(nnSSLDatasetBlosc2):
     This dataset is used to load data that has been saved with the nnSSLDataLoaderBase.
     It extends the nnSSLDatasetBlosc2 with additional information that is needed for the dataloader.
     """
+    
+    @staticmethod
+    def find_preferred_modality(img, preference_modality_list=None):
+        """
+        Find the first available modality from the preference list (case-insensitive).
+        If none found, return the first available modality.
+        
+        Args:
+            img: IndependentImage object with subject_info containing volumes
+            preference_modality_list: List of preferred modalities (e.g., ['T1w', 'T2w', 'MPRAGE'])
+        
+        Returns:
+            tuple: (session_key, modality_key, volumes_dict) or (None, None, None) if no volumes found
+        """
+        if preference_modality_list is None:
+            preference_modality_list = ['T1w', 'T2w', 'MPRAGE', 'MP2RAGE', 'FLAIR', 'inplaneT2']
+        
+        volumes = img.subject_info.get('volumes', {})
+        if not volumes:
+            return None, None, None
+        
+        # Convert preference list to lowercase for case-insensitive comparison
+        preference_modality_lower = [mod.lower() for mod in preference_modality_list]
+        
+        # First pass: look for preferred modalities (case-insensitive)
+        for session_key, session_data in volumes.items():
+            # Create a mapping of lowercase modality names to actual keys
+            modality_mapping = {mod_key.lower(): mod_key for mod_key in session_data.keys()}
+            
+            for preferred_modality_lower in preference_modality_lower:
+                if preferred_modality_lower in modality_mapping:
+                    actual_modality_key = modality_mapping[preferred_modality_lower]
+                    return session_key, actual_modality_key, session_data[actual_modality_key]
+        
+        # Second pass: if no preferred modality found, take the first available
+        for session_key, session_data in volumes.items():
+            if session_data:  # Check if session has any modalities
+                first_modality = next(iter(session_data.keys()))
+                return session_key, first_modality, session_data[first_modality]
+        
+        return None, None, None  # No volumes found
+
     @staticmethod
     def load_case(dataset_dir: str, image_dataset: dict[str, IndependentImage], image_identifier: str):
         img = image_dataset[image_identifier]
+        if not 'volumes' in img.image_info.keys():
+            raise RuntimeError(f"Skipping case {image_identifier} - Without  volumes in image_info, cannot load data.")
+        session_key, modality_key, volumes_dict = nnSSLDatasetBlosc2ExtendInfo.find_preferred_modality(img)
+        if volumes_dict is None:
+            raise RuntimeError(f"Skipping case {image_identifier} - No preferred modality found in volumes.")
         data, anon, anat, properties = nnSSLDatasetBlosc2.load_case(dataset_dir, image_dataset, image_identifier)
-        return data, anon, anat, {**properties, **{"extra_info": img.to_dict()}}
+        return data, anon, anat, {**properties, **{"extra_info": img.to_dict(), 'subject_features':volumes_dict, 'subject_ids':img.image_path}}
 
 
 class nnsslDataLoader3DSameSubject(nnsslDataLoader3D):
@@ -227,6 +274,10 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         self.save_imgs_every_n_epochs = 200
         self._feat_handle = None
         self._bottleneck_features = []
+        self.total_batch_size = 12
+        self.num_iterations_per_epoch = 10
+        self.num_val_iterations_per_epoch = 5
+        self.num_epochs = 2
         
     def _get_net(self):
         return self.network.module if isinstance(self.network, DDP) else self.network
@@ -308,7 +359,7 @@ class BaseMAETrainerExtended(BaseMAETrainer):
 
         :return:
         """
-        return BottleNeckContrastiveLoss()
+        return ReconstructionAndSimilarityLoss(bottleneck_dim=320*5*5*5, subject_dim=101)#BottleNeckContrastiveLoss()
     
     def train_step(self, batch: dict) -> dict:
         data = batch["data"]
@@ -327,9 +378,10 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         mask = mask.repeat_interleave(rep_D, dim=2).repeat_interleave(rep_H, dim=3).repeat_interleave(rep_W, dim=4)
 
         masked_data = data * mask
+        
 
         self.optimizer.zero_grad(set_to_none=True)
-        print(self.optimizer)
+        #print(self.optimizer)
         # Autocast is a little bitch.
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
@@ -338,7 +390,7 @@ class BaseMAETrainerExtended(BaseMAETrainer):
             output = self.network(masked_data)
             # del data
             latent = self._bottleneck_features
-            l = self.loss(batch, output, mask, latent)
+            l = self.loss(batch, output, data, mask, latent)
             # l = self.loss(output, data, mask)
 
         if self.grad_scaler is not None:
@@ -382,7 +434,8 @@ class BaseMAETrainerExtended(BaseMAETrainer):
             output = self.network(masked_data)
 
             latent = self._bottleneck_features
-            l = self.loss(batch, output, mask, latent)
+            #l = self.loss(batch, output, mask, latent)
+            l = self.loss(batch, output, data, mask, latent)
             # l = self.loss(output, data, mask)
 
         # Important: drop reference so graph can be freed
