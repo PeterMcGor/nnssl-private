@@ -278,10 +278,6 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         self.save_imgs_every_n_epochs = 200
         self._feat_handle = None
         self._bottleneck_features = []
-        self.total_batch_size = 10
-        #self.num_iterations_per_epoch = 10
-        #self.num_val_iterations_per_epoch = 5
-        #self.num_epochs = 2
         self.prev_loss = None
         self.prev_val_loss = None
         
@@ -365,7 +361,7 @@ class BaseMAETrainerExtended(BaseMAETrainer):
 
         :return:
         """
-        return ReconstructionAndSimilarityLoss(bottleneck_dim=320*5*5*5, subject_dim=101)#BottleNeckContrastiveLoss()
+        return ReconstructionAndSimilarityLoss(bottleneck_dim=(320,5,5,5), subject_dim=101)#BottleNeckContrastiveLoss()
     
     def train_step(self, batch: dict) -> dict:
         data = batch["data"]
@@ -498,3 +494,21 @@ class BaseMAETrainerExtendedSingleSubject(BaseMAETrainerExtended):
             pad_sides=None,
         )
         return dl_tr, dl_val
+
+
+
+
+class BaseMAETrainerExtendedTest(BaseMAETrainerExtended):
+    def __init__(
+        self,
+        plan: Plan,
+        configuration_name: str,
+        fold: int,
+        pretrain_json: dict,
+        device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__(plan, configuration_name, fold, pretrain_json, device)
+        self.total_batch_size = 1
+        self.num_iterations_per_epoch = 10
+        self.num_val_iterations_per_epoch = 5
+        self.num_epochs = 2

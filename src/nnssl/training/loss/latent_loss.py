@@ -1,8 +1,123 @@
 from loguru import logger
+import numpy as np 
 from nnssl.training.loss.mse_loss import LossMaskMSELoss, MAEMSELoss
 import torch
 from torch import nn
 import torch.nn.functional as F
+
+
+class NaiveProjector(nn.Module):
+    """Original direct projection approach"""
+    def __init__(self, bottleneck_dim, subject_dim):
+        super().__init__()
+        bottleneck_flat_dim = np.prod(np.array(bottleneck_dim))    
+        self.projector = nn.Sequential(
+            nn.Linear(bottleneck_flat_dim, subject_dim * 2),  # Intermediate layer
+            nn.LayerNorm(subject_dim * 2),
+            nn.ReLU(),
+            nn.Linear(subject_dim * 2, subject_dim),     # Target: subject_dim
+            nn.LayerNorm(subject_dim)
+        )
+    
+    def forward(self, latent, batch_size):
+        # Standard flattening
+        bottleneck_flat = latent.view(batch_size, -1)  # [batch, 40000]
+        return self.projector(bottleneck_flat)
+
+
+class ProgressiveProjector(nn.Module):
+    """Progressive reduction approach"""
+    def __init__(self, bottleneck_dim, subject_dim):
+        super().__init__()
+        bottleneck_flat_dim = np.prod(np.array(bottleneck_dim))
+        self.projector = nn.Sequential(
+            nn.Linear(bottleneck_flat_dim, 2048),     
+            nn.LayerNorm(2048),
+            nn.ReLU(),
+            #nn.Dropout(0.1), Regularitation probably not needed here
+            
+            nn.Linear(2048, 512),                 
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            #nn.Dropout(0.1),
+            
+            nn.Linear(512, subject_dim),          
+            nn.LayerNorm(subject_dim)
+        )
+    
+    def forward(self, latent, batch_size):
+        # Standard flattening
+        bottleneck_flat = latent.view(batch_size, -1)  
+        return self.projector(bottleneck_flat)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+class PooledProgressiveProjector(nn.Module):
+    """Spatial pooling + progressive reduction with channel portion selection"""
+    
+    def __init__(self, bottleneck_dim, subject_dim, channel_portion=1.0):
+        """
+        Args:
+            bottleneck_dim: Original bottleneck dimensions as shape (e.g., [320, 5, 5, 5])
+            subject_dim: Target embedding dimension
+            channel_portion: Portion of channels to use (0.0 to 1.0)
+                - 0.0: Use 1 channel (minimum to avoid errors)
+                - 1.0: Use all channels
+                - 0.5: Use half the channels (first half)
+        """
+        super().__init__()
+        
+        # For compatibility with bottleneck_flat_dim = np.prod(np.array(bottleneck_dim))
+        if isinstance(bottleneck_dim, (list, tuple)):
+            self.bottleneck_shape = bottleneck_dim
+            total_channels = bottleneck_dim[0]  # 320
+            self.spatial_dims = bottleneck_dim[1:]  # [5, 5, 5]
+        else:
+            # If it's already flattened dimension, assume default shape
+            raise ValueError("bottleneck_dim should be the shape [channels, d, h, w], not flattened dimension")
+        
+        # Calculate number of channels to use based on portion
+        self.channel_portion = max(0.0, min(1.0, channel_portion))  # Clamp between 0 and 1
+        n_channels_to_use = max(1, int(total_channels * self.channel_portion))  # At least 1 channel
+        
+        # Select first n_channels_to_use channels
+        self.selected_channels = list(range(n_channels_to_use))
+        
+        # Calculate dimensions after pooling and channel selection
+        pooled_spatial = 2 * 2 * 2  # After adaptive_avg_pool3d to (2,2,2)
+        bottleneck_flat_dim = n_channels_to_use * pooled_spatial
+        
+        print(f"Using {n_channels_to_use}/{total_channels} channels ({self.channel_portion:.1%})")
+        print(f"Flattened dimension after pooling: {bottleneck_flat_dim}")
+        
+        self.projector = nn.Sequential(
+            nn.Linear(bottleneck_flat_dim, 1024),
+            nn.LayerNorm(1024),
+            nn.ReLU(),
+            
+            nn.Linear(1024, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            
+            nn.Linear(256, subject_dim),
+            nn.LayerNorm(subject_dim)
+        )
+    
+    def forward(self, latent, batch_size):
+        # Select portion of channels BEFORE pooling: [batch, 320, 5, 5, 5] -> [batch, n_selected, 5, 5, 5]
+        if len(self.selected_channels) < latent.shape[1]:
+            latent_selected = latent[:, self.selected_channels, :, :, :]
+        else:
+            latent_selected = latent
+        
+        # Apply spatial pooling to selected channels: [batch, n_selected, 5, 5, 5] -> [batch, n_selected, 2, 2, 2]
+        pooled = F.adaptive_avg_pool3d(latent_selected, (2, 2, 2))
+        # Flatten: [batch, n_selected * 2 * 2 * 2]
+        bottleneck_flat = pooled.view(batch_size, -1)
+        return self.projector(bottleneck_flat)
 
 
 class BottleNeckContrastiveLoss(nn.Module):
@@ -18,20 +133,18 @@ class BottleNeckContrastiveLoss(nn.Module):
 
 
 class SubjectImageSimilarityLoss(nn.Module):
-    def __init__(self, bottleneck_dim, subject_dim, 
-                 similarity_weight=1.0, variance_weight=0.1):
+    def __init__(self, bottleneck_dim, subject_dim,
+                 similarity_weight=1.0, variance_weight=0.1,
+                 image_projector=None, channels_proportion_at_embedding = 1.0):  # Pass module object here
         super().__init__()
         self.similarity_weight = similarity_weight
         self.variance_weight = variance_weight
         
-        # Project images to SUBJECT dimension (learnable)
-        self.image_to_subject_projector = nn.Sequential(
-            nn.Linear(bottleneck_dim, subject_dim * 2),  # Intermediate layer
-            nn.LayerNorm(subject_dim * 2),
-            nn.ReLU(),
-            nn.Linear(subject_dim * 2, subject_dim),     # Target: subject_dim
-            nn.LayerNorm(subject_dim)
-        )
+        # Use provided projector or default to ProgressiveProjector
+        if image_projector is None:
+            self.image_to_subject_projector = PooledProgressiveProjector(bottleneck_dim, subject_dim, channel_portion=channels_proportion_at_embedding)
+        else:
+            self.image_to_subject_projector = image_projector
         
         # NO learnable projection for subjects!
         
@@ -187,8 +300,7 @@ class SubjectImageSimilarityLoss(nn.Module):
         batch_size = latent.shape[0]
         
         # Project images to subject space
-        bottleneck_flat = latent.view(batch_size, -1)
-        image_projected = self.image_to_subject_projector(bottleneck_flat)
+        image_projected = self.image_to_subject_projector(latent, batch_size)
 
 
         # Check for NaN after projection
@@ -313,7 +425,7 @@ class ReconstructionAndSimilarityLoss(nn.Module):
         Compound loss combining reconstruction (MSE) and subject-image similarity.
         
         Args:
-            bottleneck_dim: Dimension of the latent bottleneck
+            bottleneck_dim: Dimensions of the latent bottleneck
             subject_dim: Dimension of subject features
             similarity_kwargs: Dict of kwargs for SubjectImageSimilarityLoss
             weight_reconstruction: Weight for reconstruction loss
@@ -379,4 +491,49 @@ class ReconstructionAndSimilarityLoss(nn.Module):
             logger.info(f"Recon Loss: {recon_loss:.6f}, Sim Loss: {sim_loss:.6f}, Total: {total_loss:.6f}")
         
         return total_loss
+
+class ReconstructionAndSimilarityLossPortion05(ReconstructionAndSimilarityLoss):
+    """
+    Inherits from ReconstructionAndSimilarityLoss but uses only 50% of channels 
+    for the similarity loss computation.
+    """
+    
+    def __init__(self,
+                 # Similarity loss parameters
+                 bottleneck_dim, 
+                 subject_dim,
+                 similarity_kwargs=None,
+                 # Loss weights
+                 weight_reconstruction=1.0, 
+                 weight_similarity=0.1):
+        """
+        Initialize with same parameters as parent, but automatically set 
+        channels_proportion_at_embedding to 0.5
+        
+        Args:
+            bottleneck_dim: Dimensions of the latent bottleneck 
+            subject_dim: Dimension of subject features
+            similarity_kwargs: Dict of kwargs for SubjectImageSimilarityLoss
+            weight_reconstruction: Weight for reconstruction loss
+            weight_similarity: Weight for similarity loss
+        """
+        
+        # Default similarity loss parameters
+        if similarity_kwargs is None:
+            similarity_kwargs = {
+                'similarity_weight': 1.0,
+                'variance_weight': 0.1
+            }
+        
+        # Add the 50% channel portion parameter
+        similarity_kwargs['channels_proportion_at_embedding'] = 0.5
+        
+        # Call parent constructor with modified similarity_kwargs
+        super().__init__(
+            bottleneck_dim=bottleneck_dim,
+            subject_dim=subject_dim,
+            similarity_kwargs=similarity_kwargs,
+            weight_reconstruction=weight_reconstruction,
+            weight_similarity=weight_similarity
+        )
 
