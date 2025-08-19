@@ -10,6 +10,7 @@ import numpy as np
 from loguru import logger
 import torch
 from torch import distributed as dist
+from torch._dynamo import OptimizedModule
 from nnssl.utilities.collate_outputs import collate_outputs
 from nnssl.architectures.get_network_by_name import get_network_by_name
 from nnssl.architectures.get_network_from_plan import get_network_from_plans
@@ -339,6 +340,39 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         # Recreate scheduler so it knows about all param groups
         self.lr_scheduler = PolyLRScheduler(self.optimizer, self.initial_lr, self.num_epochs)
 
+    def load_checkpoint(self, filename_or_checkpoint: Union[dict, str]) -> None:
+        super(BaseMAETrainerExtended, self).load_checkpoint()  # Load network, optimizer etc
+        if isinstance(filename_or_checkpoint, str):
+            checkpoint = torch.load(filename_or_checkpoint, map_location=self.device)
+        self.loss.load_state_dict(checkpoint["loss_weights"])
+
+    def save_checkpoint(self, filename: str, live_upload: bool = False) -> None:
+        if self.local_rank == 0:
+            if not self.disable_checkpointing:
+                if self.is_ddp:
+                    mod = self.network.module
+                else:
+                    mod = self.network
+                if isinstance(mod, OptimizedModule):
+                    mod = mod._orig_mod
+
+                checkpoint = {
+                    "network_weights": mod.state_dict(),
+                    "loss_weights": self.loss.state_dict(),
+                    "optimizer_state": self.optimizer.state_dict(),
+                    "grad_scaler_state": self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
+                    "logging": self.logger.get_checkpoint(),
+                    "_best_ema": self._best_ema,
+                    "current_epoch": self.current_epoch + 1,
+                    "init_args": self.my_init_kwargs,
+                    "trainer_name": self.__class__.__name__,
+                    "nnssl_adaptation_plan": self.adaptation_plan.serialize(),
+                }
+                checkpoint = self._convert_numpy(checkpoint)
+                torch.save(checkpoint, filename)
+            else:
+                self.print_to_log_file("No checkpoint written, checkpointing is disabled")
+    
     def get_tr_and_val_datasets(self):
         # create dataset split (We only have 'all' as splits anyway!)
         tr_subjects, val_subjects = self.do_split()
