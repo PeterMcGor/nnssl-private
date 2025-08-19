@@ -6,6 +6,7 @@ from torch import nn
 import torch.nn.functional as F
 
 
+
 class NaiveProjector(nn.Module):
     """Original direct projection approach"""
     def __init__(self, bottleneck_dim, subject_dim):
@@ -50,10 +51,7 @@ class ProgressiveProjector(nn.Module):
         bottleneck_flat = latent.view(batch_size, -1)  
         return self.projector(bottleneck_flat)
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
+
 
 class PooledProgressiveProjector(nn.Module):
     """Spatial pooling + progressive reduction with channel portion selection"""
@@ -171,15 +169,15 @@ class SubjectImageSimilarityLoss(nn.Module):
         subject_features = torch.tensor(subject_features, dtype=torch.float32)
         subject_features = subject_features.to(device)
         # CRITICAL FIX: Row-wise normalization (per case, independent of batch)
-        row_means = subject_features.mean(dim=1, keepdim=True)
-        row_stds = subject_features.std(dim=1, keepdim=True, unbiased=False)
+        #row_means = subject_features.mean(dim=1, keepdim=True)
+        #row_stds = subject_features.std(dim=1, keepdim=True, unbiased=False)
         
         # Avoid division by zero: if std is too small, don't normalize that row
-        safe_std = torch.where(row_stds < 1e-6, torch.ones_like(row_stds), row_stds)
-        subject_features = (subject_features - row_means) / safe_std
+        #safe_std = torch.where(row_stds < 1e-6, torch.ones_like(row_stds), row_stds)
+        #subject_features = (subject_features - row_means) / safe_std
         
         # Clip extreme values after normalization
-        subject_features = torch.clamp(subject_features, min=-10.0, max=10.0)
+        #subject_features = torch.clamp(subject_features, min=-10.0, max=10.0)
             
         return subject_features, subject_ids
     
@@ -285,16 +283,16 @@ class SubjectImageSimilarityLoss(nn.Module):
             subject_features = torch.nan_to_num(subject_features, nan=0.0)
         
         # Check for rows with extreme values and handle them individually
-        row_maxes = subject_features.abs().max(dim=1, keepdim=True)[0]
-        extreme_rows = row_maxes > 1e6
-        if extreme_rows.any():
-            print(f"WARNING: {extreme_rows.sum()} rows with extreme values")
+        #row_maxes = subject_features.abs().max(dim=1, keepdim=True)[0]
+        #extreme_rows = row_maxes > 1e6
+        #if extreme_rows.any():
+        #    print(f"WARNING: {extreme_rows.sum()} rows with extreme values")
             # Clip extreme rows individually
-            subject_features = torch.where(
-                extreme_rows.expand_as(subject_features),
-                torch.clamp(subject_features, min=-1e6, max=1e6),
-                subject_features
-            )
+        #    subject_features = torch.where(
+        #        extreme_rows.expand_as(subject_features),
+        #        torch.clamp(subject_features, min=-1e6, max=1e6),
+        #        subject_features
+        #    )
         
         latent = latent[0]
         batch_size = latent.shape[0]
@@ -488,7 +486,7 @@ class ReconstructionAndSimilarityLoss(nn.Module):
         
         # Optional: Print component losses for monitoring
         if self.weight_reconstruction != 0 and self.weight_similarity != 0:
-            logger.info(f"Recon Loss: {recon_loss:.6f}, Sim Loss: {sim_loss:.6f}, Total: {total_loss:.6f}")
+            logger.info(f"Recon Loss: {recon_loss:.6f}, Sim Loss: {sim_loss:.6f}, Total: {total_loss:.6f} with {len(self.similarity_loss.image_to_subject_projector.selected_channels)} bottleneck channels")
         
         return total_loss
 

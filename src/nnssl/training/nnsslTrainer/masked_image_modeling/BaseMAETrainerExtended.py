@@ -17,7 +17,7 @@ from nnssl.architectures.get_network_from_plan import get_network_from_plans
 from nnssl.ssl_data.configure_basic_dummyDA import configure_rotation_dummyDA_mirroring_and_inital_patch_size
 
 from nnssl.training.loss.mse_loss import MAEMSELoss, LossMaskMSELoss
-from nnssl.training.loss.latent_loss import BottleNeckContrastiveLoss, ReconstructionAndSimilarityLoss, SubjectImageSimilarityLoss
+from nnssl.training.loss.latent_loss import BottleNeckContrastiveLoss, ReconstructionAndSimilarityLoss, ReconstructionAndSimilarityLossPortion05, SubjectImageSimilarityLoss
 from nnssl.training.nnsslTrainer.masked_image_modeling.BaseMAETrainer import BaseMAETrainer
 from nnssl.training.lr_scheduler.polylr import PolyLRScheduler
 
@@ -40,6 +40,14 @@ class nnSSLDatasetBlosc2ExtendInfo(nnSSLDatasetBlosc2):
     This dataset is used to load data that has been saved with the nnSSLDataLoaderBase.
     It extends the nnSSLDatasetBlosc2 with additional information that is needed for the dataloader.
     """
+    @staticmethod
+    def get_subject_reference_volumes(img):
+        volumes = img.subject_info.get('reference', {}).get('volumes', {})
+        session_key = img.subject_info.get('reference', {}).get('session', None)
+        modality_key = img.subject_info.get('reference', {}).get('modality', None)
+        if not volumes:
+            return None, None, None
+        return session_key, modality_key, volumes
     
     @staticmethod
     def find_preferred_modality(img, preference_modality_list=None):
@@ -87,10 +95,11 @@ class nnSSLDatasetBlosc2ExtendInfo(nnSSLDatasetBlosc2):
         img = image_dataset[image_identifier]
         if not 'volumes' in img.image_info.keys():
             raise RuntimeError(f"Skipping case {image_identifier} - Without  volumes in image_info, cannot load data.")
-        session_key, modality_key, volumes_dict = nnSSLDatasetBlosc2ExtendInfo.find_preferred_modality(img)
+        #session_key, modality_key, volumes_dict = nnSSLDatasetBlosc2ExtendInfo.find_preferred_modality(img)
+        session_key, modality_key, volumes_dict = nnSSLDatasetBlosc2ExtendInfo.get_subject_reference_volumes(img)
         if volumes_dict is None:
             raise RuntimeError(f"Skipping case {image_identifier} - No preferred modality found in volumes.")
-        if float(volumes_dict['total intracranial']) < 1000:
+        if float(volumes_dict['total intracranial']) < 1:
             raise RuntimeError(f"Skipping case {image_identifier} - Total intracranial volume is too small: {volumes_dict['total intracranial']}.")
         data, anon, anat, properties = nnSSLDatasetBlosc2.load_case(dataset_dir, image_dataset, image_identifier)
         return data, anon, anat, {**properties, **{"extra_info": img.to_dict(), 'subject_features':volumes_dict, 'subject_ids':img.image_path}}
@@ -281,6 +290,7 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         self._bottleneck_features = []
         self.prev_loss = None
         self.prev_val_loss = None
+
         
     def _get_net(self):
         return self.network.module if isinstance(self.network, DDP) else self.network
@@ -505,6 +515,18 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         
         self.logger.log("val_losses", loss_here, self.current_epoch)
 
+class BaseMAETrainerExtended_BS08(BaseMAETrainerExtended):
+    def __init__(
+        self,
+        plan: Plan,
+        configuration_name: str,
+        fold: int,
+        pretrain_json: dict,
+        device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__(plan, configuration_name, fold, pretrain_json, device)
+        self.total_batch_size = 8  # Set total batch size to 8
+
 
 class BaseMAETrainerExtendedSingleSubject(BaseMAETrainerExtended):
 
@@ -528,8 +550,30 @@ class BaseMAETrainerExtendedSingleSubject(BaseMAETrainerExtended):
             pad_sides=None,
         )
         return dl_tr, dl_val
+    
 
+class BaseMAETrainerExtended05Emb(BaseMAETrainerExtended):
+    def build_loss(self):
+        """
+        This is where you build your loss function. You can use anything from torch.nn here.
+        In general the MAE losses are only applied on regions where the mask is 0.
 
+        :return:
+        """
+        return ReconstructionAndSimilarityLossPortion05(bottleneck_dim=(320,5,5,5), subject_dim=101,)
+    
+class BaseMAETrainerExtended05Emb_BS8(BaseMAETrainerExtended05Emb):
+
+    def __init__(
+        self,
+        plan: Plan,
+        configuration_name: str,
+        fold: int,
+        pretrain_json: dict,
+        device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__(plan, configuration_name, fold, pretrain_json, device)
+        self.total_batch_size = 8
 
 
 class BaseMAETrainerExtendedTest(BaseMAETrainerExtended):
@@ -542,7 +586,11 @@ class BaseMAETrainerExtendedTest(BaseMAETrainerExtended):
         device: torch.device = torch.device("cuda"),
     ):
         super().__init__(plan, configuration_name, fold, pretrain_json, device)
-        self.total_batch_size = 1
+        self.total_batch_size = 2
         self.num_iterations_per_epoch = 10
         self.num_val_iterations_per_epoch = 5
         self.num_epochs = 2
+
+    
+    #def build_loss(self):
+    #    return ReconstructionAndSimilarityLossPortion05(bottleneck_dim=(320,5,5,5), subject_dim=101,)
