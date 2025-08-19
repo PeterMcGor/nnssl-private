@@ -42,11 +42,25 @@ class nnSSLDatasetBlosc2ExtendInfo(nnSSLDatasetBlosc2):
     """
     @staticmethod
     def get_subject_reference_volumes(img):
-        volumes = img.subject_info.get('reference', {}).get('volumes', {})
-        session_key = img.subject_info.get('reference', {}).get('session', None)
-        modality_key = img.subject_info.get('reference', {}).get('modality', None)
+        if img.subject_info is None:
+            return None, None, None
+        
+        # Additional safety check
+        if not hasattr(img, 'subject_info') or img.subject_info is None:
+            print(f"Warning: Image {img.image_path} has no subject_info.")
+            return None, None, None
+        
+        reference_info = img.subject_info.get('reference', {})
+        if reference_info is None:
+            return None, None, None
+            
+        volumes = reference_info.get('volumes', {})
+        session_key = reference_info.get('session', None)
+        modality_key = reference_info.get('modality', None)
+        
         if not volumes:
             return None, None, None
+            
         return session_key, modality_key, volumes
     
     @staticmethod
