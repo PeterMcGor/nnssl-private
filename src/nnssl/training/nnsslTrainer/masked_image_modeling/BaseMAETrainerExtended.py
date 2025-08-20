@@ -361,7 +361,7 @@ class BaseMAETrainerExtended(BaseMAETrainer):
         self.lr_scheduler = PolyLRScheduler(self.optimizer, self.initial_lr, self.num_epochs)
 
     def load_checkpoint(self, filename_or_checkpoint: Union[dict, str]) -> None:
-        super(BaseMAETrainerExtended, self).load_checkpoint()  # Load network, optimizer etc
+        super(BaseMAETrainerExtended, self).load_checkpoint(filename_or_checkpoint)  # Load network, optimizer etc
         if isinstance(filename_or_checkpoint, str):
             checkpoint = torch.load(filename_or_checkpoint, map_location=self.device)
         self.loss.load_state_dict(checkpoint["loss_weights"])
