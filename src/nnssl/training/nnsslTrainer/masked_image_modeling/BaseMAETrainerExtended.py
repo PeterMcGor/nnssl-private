@@ -11,15 +11,11 @@ from loguru import logger
 import torch
 from torch import distributed as dist
 from torch._dynamo import OptimizedModule
-from nnssl.utilities.collate_outputs import collate_outputs
-from nnssl.architectures.get_network_by_name import get_network_by_name
-from nnssl.architectures.get_network_from_plan import get_network_from_plans
-from nnssl.ssl_data.configure_basic_dummyDA import configure_rotation_dummyDA_mirroring_and_inital_patch_size
 
-from nnssl.training.loss.mse_loss import MAEMSELoss, LossMaskMSELoss
-from nnssl.training.loss.latent_loss import BottleNeckContrastiveLoss, ReconstructionAndSimilarityLoss, ReconstructionAndSimilarityLossPortion05, SubjectImageSimilarityLoss
+from nnssl.training.loss.latent_loss import  ReconstructionAndSimilarityLoss, ReconstructionAndSimilarityLossPortion05, ReconstructionAndSimilarityUniquenessLoss, SubjectImageSimilarityLoss
 from nnssl.training.nnsslTrainer.masked_image_modeling.BaseMAETrainer import BaseMAETrainer
 from nnssl.training.lr_scheduler.polylr import PolyLRScheduler
+from nnssl.utilities.collate_outputs import collate_outputs
 
 from torch import autocast
 from nnssl.utilities.helpers import dummy_context
@@ -32,6 +28,7 @@ from nnssl.experiment_planning.experiment_planners.plan import Plan
 
 from nnssl.data.dataloading.dataset import nnSSLDatasetBlosc2
 from nnssl.data.raw_dataset import Collection, IndependentImage
+
 from nnssl.ssl_data.dataloading.data_loader_3d import nnsslDataLoader3D
 
 
@@ -117,6 +114,25 @@ class nnSSLDatasetBlosc2ExtendInfo(nnSSLDatasetBlosc2):
             raise RuntimeError(f"Skipping case {image_identifier} - Total intracranial volume is too small: {volumes_dict['total intracranial']}.")
         data, anon, anat, properties = nnSSLDatasetBlosc2.load_case(dataset_dir, image_dataset, image_identifier)
         return data, anon, anat, {**properties, **{"extra_info": img.to_dict(), 'subject_features':volumes_dict, 'subject_ids':img.image_path}}
+
+
+class nnSSLDatasetBlosc2ExtendInfoWithHealth(nnSSLDatasetBlosc2ExtendInfo):
+    @staticmethod
+    def load_case(dataset_dir: str, image_dataset: dict[str, IndependentImage], image_identifier: str):
+        img = image_dataset[image_identifier]
+        if not 'volumes' in img.image_info.keys():
+            raise RuntimeError(f"Skipping case {image_identifier} - Without  volumes in image_info, cannot load data.")
+        if not 'health_status' in img.subject_info.keys():
+            raise RuntimeError(f"Skipping case {image_identifier} - Without health information in subject_info, cannot load data.")
+        #session_key, modality_key, volumes_dict = nnSSLDatasetBlosc2ExtendInfo.find_preferred_modality(img)
+        session_key, modality_key, volumes_dict = nnSSLDatasetBlosc2ExtendInfo.get_subject_reference_volumes(img)
+        if volumes_dict is None:
+            raise RuntimeError(f"Skipping case {image_identifier} - No preferred modality found in volumes.")
+        if float(volumes_dict['total intracranial']) < 1:
+            raise RuntimeError(f"Skipping case {image_identifier} - Total intracranial volume is too small: {volumes_dict['total intracranial']}.")
+        data, anon, anat, properties = nnSSLDatasetBlosc2.load_case(dataset_dir, image_dataset, image_identifier)
+        return data, anon, anat, {**properties, **{"extra_info": img.to_dict(), 'subject_features':volumes_dict, 'subject_ids':img.image_path}}
+
 
 
 class nnsslDataLoader3DSameSubject(nnsslDataLoader3D):
@@ -590,6 +606,78 @@ class BaseMAETrainerExtended05Emb_BS8(BaseMAETrainerExtended05Emb):
         self.total_batch_size = 8
 
 
+class BaseMAETrainerExtendedHealth(BaseMAETrainerExtended):
+    def __init__(
+        self,
+        plan: Plan,
+        configuration_name: str,
+        fold: int,
+        pretrain_json: dict,
+        device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__(plan, configuration_name, fold, pretrain_json, device)
+        self.total_batch_size = 10
+        self.num_iterations_per_epoch = 250
+        self.num_val_iterations_per_epoch = 50
+        self.num_epochs = 500
+
+         
+    def get_tr_and_val_datasets(self):
+        # create dataset split (We only have 'all' as splits anyway!)
+        tr_subjects, val_subjects = self.do_split()
+
+        def trim_json_dict(json_dict):
+            """
+            Trim the JSON dictionary to only include the specified subjects.
+            """
+            n_removed_subjects = 0
+            n_keep_subjects = 0
+            datasets_to_remove = []
+            for dataset_id in json_dict['datasets']:
+                subjects_to_remove = []
+                dataset = json_dict['datasets'][dataset_id]
+                for subject_id, subject in dataset['subjects'].items():
+                    if 'health_status' not in subject['subject_info'].keys():
+                        subjects_to_remove.append(subject_id)
+                        n_removed_subjects += 1
+                    else:
+                        n_keep_subjects += 1
+                for subject in subjects_to_remove:
+                    del dataset['subjects'][subject]
+                if len(dataset['subjects']) == 0:
+                    datasets_to_remove.append(dataset_id)
+            for dataset_id in datasets_to_remove:
+                del json_dict['datasets'][dataset_id]
+                    
+            print(f"Removed {n_removed_subjects} subjects without health information from the dataset.")
+            print(f"Kept {n_keep_subjects} subjects with health information in the dataset.")
+            return json_dict
+        
+        self.pretrain_json = trim_json_dict(self.pretrain_json)
+        collection = Collection.from_dict(self.pretrain_json)
+        #collection = FilterableCollection.from_dict(self.pretrain_json)
+
+        # Check what would be filtered
+        #stats = collection.get_filtered_collection_stats()
+        #print(f"Total images: {stats['total_images']}")
+        #print(f"Images to keep: {stats['kept_images']}")
+        #print(f"Images to remove: {stats['removed_images']}")
+        #collection = collection.create_filtered_collection()
+
+        dataset_tr = nnSSLDatasetBlosc2ExtendInfoWithHealth(self.preprocessed_dataset_folder, collection, tr_subjects, self.iimg_filters)
+        dataset_val = nnSSLDatasetBlosc2ExtendInfoWithHealth(
+            self.preprocessed_dataset_folder, collection, val_subjects, self.iimg_filters
+        )
+
+        logger.info(f"Train dataset contains {len(dataset_tr.image_dataset)} images.")
+        logger.info(f"Validation dataset contains {len(dataset_val.image_dataset)} images.")
+
+        return dataset_tr, dataset_val
+
+    def build_loss(self):
+        return ReconstructionAndSimilarityUniquenessLoss(bottleneck_dim=(320,5,5,5), subject_dim=101, num_unique_classes=2)
+
+
 class BaseMAETrainerExtendedTest(BaseMAETrainerExtended):
     def __init__(
         self,
@@ -604,7 +692,3 @@ class BaseMAETrainerExtendedTest(BaseMAETrainerExtended):
         self.num_iterations_per_epoch = 10
         self.num_val_iterations_per_epoch = 5
         self.num_epochs = 2
-
-    
-    #def build_loss(self):
-    #    return ReconstructionAndSimilarityLossPortion05(bottleneck_dim=(320,5,5,5), subject_dim=101,)
