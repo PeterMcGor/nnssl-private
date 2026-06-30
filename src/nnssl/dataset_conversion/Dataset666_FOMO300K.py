@@ -620,6 +620,9 @@ def _create_pretrain_json(fomo300k_root_dir: Path):
     mapping_csv_data = fomo300k_root_dir / "mapping.tsv"
     mri_info_csv_data = fomo300k_root_dir / "mri_info.tsv"
     participants_info_csv_data = fomo300k_root_dir / "participants.tsv"
+    participants_empty_group = fomo300k_root_dir / "fomo300k_brain_age_group_labels.csv"
+    brain_age_csv_path = "/opt/datasets/nnssl/BrainAgeEstimator/results/fomo300k_brain_age_20260615_153630.csv"
+    sex_predictions_csv_path = "/opt/datasets/FOMO300K/matched_volumes_sex_harmonized_mb20_sex_RF_predictions.csv"
 
     mapping_csv = pd.read_csv(mapping_csv_data, sep="\t")
     mri_info_csv = pd.read_csv(mri_info_csv_data, sep="\t")
@@ -689,7 +692,34 @@ def _create_pretrain_json(fomo300k_root_dir: Path):
 
     # Sanity cap — ages above 130 are almost certainly errors
     participants_info_csv.loc[participants_info_csv['age_assumed'] > 130, 'age_assumed'] = np.nan
+    # I want that when in participants_info_csv the group column is empty, it will be filled with the value from participants_empty_group "group_found_assumedcolumn
+    
+    participants_empty_group_df = pd.read_csv(participants_empty_group)
+    participants_info_csv = participants_info_csv.merge(
+    participants_empty_group_df[['dataset', 'participant_id', 'group_found_assumed']],
+    on=['dataset', 'participant_id'],
+    how='left')
+    participants_info_csv['group'] = participants_info_csv['group'].fillna(
+        participants_info_csv.pop('group_found_assumed')
+    )
+
     participants_info_csv['group_assumed'] = participants_info_csv['group'].apply(_clean_group)
+
+    brain_age_df = pd.read_csv(brain_age_csv_path, usecols=['dataset', 'participant_id', 'session_id',
+                                                             'predicted_brain_age', 'brain_age_difference', 'raw_prediction'])
+    participants_info_csv = participants_info_csv.merge(
+        brain_age_df,
+        on=['dataset', 'participant_id', 'session_id'],
+        how='left'
+    )
+
+    sex_pred_df = pd.read_csv(sex_predictions_csv_path, usecols=['dataset', 'participant_id', 'session_id',
+                                                                   'sex_for_training', 'sex_assumed_corrected'])
+    participants_info_csv = participants_info_csv.merge(
+        sex_pred_df,
+        on=['dataset', 'participant_id', 'session_id'],
+        how='left'
+    )
 
     # ── Cross-session value recovery & longitudinal detection ─────────────
     # Each (dataset, participant_id) pair can have multiple session rows.
@@ -728,35 +758,39 @@ def _create_pretrain_json(fomo300k_root_dir: Path):
         )
         print(f"Missing {col}: {n_missing_sessions} sessions | {n_missing_subjects} subjects (all sessions missing)")
 
-    mapping_csv = pd.merge(mapping_csv, participants_info_csv[["dataset", "participant_id", "session_id", 'age','age_assumed', 'sex', 'sex_assumed', 'group', 'group_assumed']], on=["dataset", "participant_id", "session_id"], how="left")
+    print("Participants info keys:", participants_info_csv.keys(), participants_info_csv.shape)
+    print("Mapping info keys:", mapping_csv.keys(), mapping_csv.shape)
+    #mapping_csv = pd.merge(mapping_csv, participants_info_csv[["dataset", "participant_id", "session_id", 'age','age_assumed', 'sex', 'sex_assumed', 'group', 'group_assumed', 'predicted_brain_age', 'brain_age_difference', 'raw_prediction', 'sex_for_training', 'sex_assumed_corrected']], on=["dataset", "participant_id", "session_id"], how="left")
     print(f"Number of rows and columns in mapping_csv after second merge: {mapping_csv.shape}")
     print(mapping_csv.keys())
     # Brain age estimation just on T1's
-    brain_age_estimation = mapping_csv[mapping_csv.modality_assumed == 'T1']
-    print("Assert brain age estimation modality", brain_age_estimation.modality_assumed.unique())
-    brain_age_estimation = brain_age_estimation[['dataset', 'new_path', 'participant_id', 'session_id', 'age','age_assumed', 'sex', 'sex_assumed', 'group', 'group_assumed']]
-    brain_age_estimation['Path'] = '/opt/datasets/FOMO300K/' + brain_age_estimation['dataset']+os.sep+ brain_age_estimation['new_path']
-    print(brain_age_estimation.head())
-    print('Mean Age', brain_age_estimation.age_assumed.median(), 'Missing', brain_age_estimation.age_assumed.isna().sum())
-    brain_age_estimation.loc[brain_age_estimation.age_assumed.isna(), 'age_assumed'] = 35
-    print('Median Age after filling missing values with median',brain_age_estimation.age_assumed.median(), 'Missing after filling', brain_age_estimation.age_assumed.isna().sum())
-    brain_age_estimation['Age'] = brain_age_estimation['age_assumed']
-    brain_age_estimation.to_csv('FOMO300K_brain_age_estimation.csv')
+    #brain_age_estimation = mapping_csv[mapping_csv.modality_assumed == 'T1']
+    #print("Assert brain age estimation modality", brain_age_estimation.modality_assumed.unique())
+    #brain_age_estimation = brain_age_estimation[['dataset', 'new_path', 'participant_id', 'session_id', 'age','age_assumed', 'sex', 'sex_assumed', 'group', 'group_assumed']]
+    #brain_age_estimation['Path'] = '/opt/datasets/FOMO300K/' + brain_age_estimation['dataset']+os.sep+ brain_age_estimation['new_path']
+    #print(brain_age_estimation.head())
+    #print('Mean Age', brain_age_estimation.age_assumed.median(), 'Missing', brain_age_estimation.age_assumed.isna().sum())
+    #brain_age_estimation.loc[brain_age_estimation.age_assumed.isna(), 'age_assumed'] = 35
+    #print('Median Age after filling missing values with median',brain_age_estimation.age_assumed.median(), 'Missing after filling', brain_age_estimation.age_assumed.isna().sum())
+    #brain_age_estimation['Age'] = brain_age_estimation['age_assumed']
+    #brain_age_estimation.to_csv('FOMO300K_brain_age_estimation.csv')
 
 
 
     collection = Collection(collection_name="Dataset666_FOMO300K", collection_index=666)
 
-    subject_info_keys = ["age", "sex", "handedness", "race", "weight", "bmi", "health_status"]
+    subject_info_keys = ["age", "sex", "handedness", "group", "group_assumed", "predicted_brain_age", "brain_age_difference", "raw_prediction"]
     image_info_keys = [
-        "derived_from",
-        "is_brain_extract",
-        "manufacturer",
-        "model_name",
-        "phase_encoding_direction",
-        "magnetic_field_strength",
-        "repetition_time",
-        "echo_time",
+        'dataset', 'old_path', 'new_path', 'old_filename', 'new_filename',
+       'participant_id', 'session_id', 'modality', 'filename', 'Modality',
+       'MagneticFieldStrength', 'Manufacturer', 'ManufacturersModelName',
+       'SoftwareVersions', 'MRAcquisitionType', 'SeriesDescription',
+       'ProtocolName', 'ScanningSequence', 'SequenceVariant', 'ScanOptions',
+       'SequenceName', 'EchoTime', 'SliceThickness', 'RepetitionTime',
+       'InversionTime', 'FlipAngle', 'modality_assumed', 'contrast_assumed',
+       'field_strength_assumed', 'manufacturer_assumed', 'software_platform',
+       'scanning_sequence_norm', 'sequence_variant_norm', 'fat_saturation',
+       'partial_fourier'
     ]
 
 
