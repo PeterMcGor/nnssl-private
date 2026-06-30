@@ -17,6 +17,7 @@ from typing import Tuple, Union, List
 import numpy as np
 from nnssl.imageio.base_reader_writer import BaseReaderWriter
 import SimpleITK as sitk
+import nibabel as nib
 
 
 class SimpleITKIO(BaseReaderWriter):
@@ -30,7 +31,20 @@ class SimpleITKIO(BaseReaderWriter):
 
         spacings_for_nnunet = []
         for f in image_fnames:
-            itk_image = sitk.ReadImage(f)
+            try:
+                itk_image = sitk.ReadImage(f)
+            except RuntimeError as e:
+                if any(kw in str(e).lower() for kw in ("direction", "orthonormal", "cosine")):
+                    print(f"WARNING: invalid direction cosines in {f} — resetting to identity and continuing")
+                    nib_img = nib.load(f)
+                    arr = nib_img.get_fdata(dtype=np.float32)
+                    # nibabel is (x,y,z); sitk array expects (z,y,x)
+                    itk_image = sitk.GetImageFromArray(arr.T if arr.ndim == 3 else arr)
+                    zooms = nib_img.header.get_zooms()
+                    itk_image.SetSpacing([float(z) for z in zooms[:arr.ndim]])
+                    # direction left as identity since the original was invalid
+                else:
+                    raise
             spacings.append(itk_image.GetSpacing())
             origins.append(itk_image.GetOrigin())
             directions.append(itk_image.GetDirection())
