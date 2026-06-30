@@ -777,21 +777,142 @@ def _create_pretrain_json(fomo300k_root_dir: Path):
 
 
 
+    # ── SynthSeg lookups (per image) ─────────────────────────────────────────
+    _META_COLS = {
+        '', 'dataset', 'participant_id', 'session_id', 'modality', 'new_filename',
+        'Unnamed: 0', 'Unnamed: 0.1', 'subject_session_id', 'modality_inferred',
+        'sex', 'age', 'age_assumed', 'predicted_brain_age', 'brain_age_difference',
+        'placeholder_suspected', 'sex_for_training', 'sex_assumed_corrected',
+    }
+
+    synthseg_vols_df = pd.read_csv(fomo300k_root_dir / "synthseg_volumes_all.csv")
+    synthseg_qc_df   = pd.read_csv(fomo300k_root_dir / "synthseg_qc_all.csv")
+    matched_vols_df  = pd.read_csv(sex_predictions_csv_path)
+
+    vol_region_cols     = [c for c in synthseg_vols_df.columns if c not in _META_COLS]
+    qc_region_cols      = [c for c in synthseg_qc_df.columns   if c not in _META_COLS]
+    matched_region_cols = [c for c in matched_vols_df.columns   if c not in _META_COLS]
+
+    _img_key = lambda r: (r['dataset'], r['participant_id'], r['session_id'], r['new_filename'])
+    vols_lookup = {_img_key(r): {c: r[c] for c in vol_region_cols if not pd.isna(r[c])}
+                   for _, r in synthseg_vols_df.iterrows()}
+    qc_lookup   = {_img_key(r): {c: r[c] for c in qc_region_cols  if not pd.isna(r[c])}
+                   for _, r in synthseg_qc_df.iterrows()}
+
+    # Per-subject harmonised volumes — one representative row per (dataset, participant_id)
+    matched_vols_lookup: dict = {}
+    for _, r in matched_vols_df.iterrows():
+        key = (r['dataset'], r['participant_id'])
+        if key not in matched_vols_lookup:
+            matched_vols_lookup[key] = {c: r[c] for c in matched_region_cols if not pd.isna(r[c])}
+
+    # Per-session participant info: (dataset, participant_id, session_id) -> dict
+    participants_lookup: dict = {
+        (r['dataset'], r['participant_id'], r['session_id']): r.to_dict()
+        for _, r in participants_info_csv.iterrows()
+    }
+
+    # ── MRI scanner keys to pull from mapping_csv into image_info ────────────
+    mri_image_keys = [
+        'MagneticFieldStrength', 'Manufacturer', 'ManufacturersModelName',
+        'SoftwareVersions', 'MRAcquisitionType', 'SeriesDescription',
+        'ProtocolName', 'ScanningSequence', 'SequenceVariant', 'ScanOptions',
+        'SequenceName', 'EchoTime', 'SliceThickness', 'RepetitionTime',
+        'InversionTime', 'FlipAngle', 'modality_assumed', 'contrast_assumed',
+        'field_strength_assumed', 'manufacturer_assumed', 'software_platform',
+        'scanning_sequence_norm', 'sequence_variant_norm', 'fat_saturation',
+        'partial_fourier',
+    ]
+
+    # ── Build Collection ──────────────────────────────────────────────────────
     collection = Collection(collection_name="Dataset666_FOMO300K", collection_index=666)
 
-    subject_info_keys = ["age", "sex", "handedness", "group", "group_assumed", "predicted_brain_age", "brain_age_difference", "raw_prediction"]
-    image_info_keys = [
-        'dataset', 'old_path', 'new_path', 'old_filename', 'new_filename',
-       'participant_id', 'session_id', 'modality', 'filename', 'Modality',
-       'MagneticFieldStrength', 'Manufacturer', 'ManufacturersModelName',
-       'SoftwareVersions', 'MRAcquisitionType', 'SeriesDescription',
-       'ProtocolName', 'ScanningSequence', 'SequenceVariant', 'ScanOptions',
-       'SequenceName', 'EchoTime', 'SliceThickness', 'RepetitionTime',
-       'InversionTime', 'FlipAngle', 'modality_assumed', 'contrast_assumed',
-       'field_strength_assumed', 'manufacturer_assumed', 'software_platform',
-       'scanning_sequence_norm', 'sequence_variant_norm', 'fat_saturation',
-       'partial_fourier'
-    ]
+    for dic in tqdm(mapping_data):
+        dataset_id   = dic['dataset']
+        subject_id   = dic['participant_id']
+        session_id   = dic['session_id']
+        new_path     = dic['new_path']
+        new_filename = dic['new_filename']
+        modality     = dic.get('modality_assumed') or dic.get('modality', 'unknown')
+
+        image_path = str(fomo300k_root_dir / dataset_id / new_path)
+
+        # image_info: MRI params + SynthSeg QC + raw per-image volumes
+        image_info = {k: dic[k] for k in mri_image_keys if k in dic and not pd.isna(dic[k])}
+        img_key = (dataset_id, subject_id, session_id, new_filename)
+        if img_key in qc_lookup:
+            image_info['synthseg_qc'] = qc_lookup[img_key]
+        if img_key in vols_lookup:
+            image_info['synthseg_volumes'] = vols_lookup[img_key]
+
+        # SynthSeg segmentation mask (only where synthseg ran)
+        anatomy_mask = None
+        if img_key in vols_lookup:
+            anatomy_mask = str(fomo300k_root_dir / "synthseg_files" / dataset_id / new_path)
+        associated_masks = AssociatedMasks(anatomy_mask=anatomy_mask)
+
+        # Participant info for this session
+        part_key = (dataset_id, subject_id, session_id)
+        prow = participants_lookup.get(part_key, {})
+        is_longitudinal = bool(prow.get('Longitudinal', False))
+
+        # subject_info: demographics + harmonised per-subject brain volumes
+        subject_info: dict = {}
+        for col in ('sex_assumed', 'sex_assumed_corrected', 'sex_for_training', 'group_assumed'):
+            val = prow.get(col)
+            if val is not None and not pd.isna(val):
+                subject_info[col] = val
+        # Age only for non-longitudinal subjects (longitudinal age goes in session_info)
+        if not is_longitudinal:
+            val = prow.get('age_assumed')
+            if val is not None and not pd.isna(val):
+                subject_info['age_assumed'] = val
+        subj_key = (dataset_id, subject_id)
+        if subj_key in matched_vols_lookup:
+            subject_info['synthseg_volumes_harmonized'] = matched_vols_lookup[subj_key]
+
+        # session_info: brain age predictions + age for longitudinal subjects
+        session_info: dict = {}
+        for col in ('predicted_brain_age', 'brain_age_difference', 'raw_prediction'):
+            val = prow.get(col)
+            if val is not None and not pd.isna(val):
+                session_info[col] = val
+        if is_longitudinal:
+            val = prow.get('age_assumed')
+            if val is not None and not pd.isna(val):
+                session_info['age_assumed'] = val
+
+        # ── Extend Collection hierarchy ───────────────────────────────────────
+        if dataset_id not in collection.datasets:
+            collection.datasets[dataset_id] = Dataset(
+                dataset_index=dataset_id, name=dataset_id, dataset_info={})
+
+        dataset_obj = collection.datasets[dataset_id]
+        if subject_id not in dataset_obj.subjects:
+            dataset_obj.subjects[subject_id] = Subject(
+                subject_id=subject_id, subject_info=subject_info or None)
+
+        subject_obj = dataset_obj.subjects[subject_id]
+        if session_id not in subject_obj.sessions:
+            subject_obj.sessions[session_id] = Session(
+                session_id=session_id,
+                session_info=session_info or None,
+                images=[])
+
+        subject_obj.sessions[session_id].images.append(
+            Image(
+                name=new_filename,
+                image_path=image_path,
+                modality=modality,
+                image_info=image_info or None,
+                associated_masks=associated_masks,
+            )
+        )
+
+    pretrain_json = collection.to_dict(relative_paths=False)
+    pretrain_json_path = fomo300k_root_dir / "pretrain_data.json"
+    save_json(pretrain_json, pretrain_json_path, indent=4, sort_keys=True)
+    print(f"Successfully saved the FOMO300K pretrain_data.json at {pretrain_json_path}")
 
 
 
