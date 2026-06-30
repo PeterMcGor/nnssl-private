@@ -20,7 +20,12 @@ from typing import Callable, Literal, Union
 
 from loguru import logger
 
+import blosc2
 import numpy as np
+
+
+def _pool_worker_init():
+    blosc2.set_nthreads(1)
 from batchgenerators.utilities.file_and_folder_operations import *
 
 
@@ -247,7 +252,7 @@ def default_preprocess(
             all_independent_images = all_independent_images[part * images_per_part : (part + 1) * images_per_part]
 
     if num_processes > 1:
-        with multiprocessing.get_context("spawn").Pool(num_processes) as p:
+        with multiprocessing.get_context("spawn").Pool(num_processes, initializer=_pool_worker_init) as p:
             r = p.map(preprocess_and_save_partial, all_independent_images)
     else:
         r = [preprocess_and_save_partial(image=img) for img in all_independent_images]
