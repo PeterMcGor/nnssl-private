@@ -1,0 +1,13 @@
+# keep the build context (nnssl-src) small: code + packaging only
+dataset_conversion_data/
+nnssl_preprocessed/
+nnssl_raw/
+nnssl_results/
+*.sqsh
+*.b2nd
+*.nii
+*.nii.gz
+*.zip
+**/__pycache__/
+*.pyc
+

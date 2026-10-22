@@ -119,3 +119,15 @@ ENV/
 *.DS_Store
 src/nnssl/utilities/add_adaptation_plan.py
 submission_print.py
+
+# bulk data under dataset_conversion_data (regenerate via its README); keep scripts + README
+dataset_conversion_data/**/pretrain_data*.json
+dataset_conversion_data/Dataset666_FOMO300K/
+# job logs, crash dumps, CE images, preprocessing outputs
+logs/
+cscs/logs/
+core_*
+*.sqsh
+nnssl_raw/
+nnssl_preprocessed/
+nnssl_results/

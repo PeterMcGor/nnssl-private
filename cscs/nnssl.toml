@@ -1,0 +1,8 @@
+image = "${SCRATCH}/ce-images/nnssl+1.0.sqsh"
+mounts = ["/capstor", "/iopsstor"]
+workdir = "/iopsstor/scratch/cscs/petermcgor"
+
+[env]
+nnssl_raw          = "${SCRATCH}/nnssl_raw"
+nnssl_preprocessed = "${SCRATCH}/nnssl_preprocessed"
+nnssl_results      = "${SCRATCH}/nnssl_results"
